@@ -28,12 +28,14 @@ def store(db_uri: str) -> SqlAlchemyScheduledTaskStore:
     return store
 
 
-def _task(store: SqlAlchemyScheduledTaskStore, seed: str = "task", **kwargs):
+def _task(
+    store: SqlAlchemyScheduledTaskStore, seed: str = "task", rrule: str = "FREQ=HOURLY", **kwargs
+):
     task = store.create(
         uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex,
         seed,
         "prompt",
-        "FREQ=HOURLY",
+        rrule,
         None,
         uuid.uuid4().hex,
         "UTC",
@@ -1388,5 +1390,30 @@ async def test_restart_after_stop_starts_recovery_scan_from_the_beginning(store)
         # The restarted scan begins at the first run, with a cutoff taken after the restart.
         assert recovered == [runs[0], runs[0]]
         assert scheduler._recovery_cutoff == int(clock.now())
+    finally:
+        await scheduler.stop()
+
+
+async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch):
+    store.configure_dispatch(False)
+    ended = _task(store, "ended", rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
+    store.configure_dispatch(True)
+    counted = _task(store, "counted", rrule="FREQ=HOURLY;COUNT=2")
+    clock = FakeClock(counted.next_run_at)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    try:
+        for _ in range(4):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            clock.advance(3600)
+        assert store.get(ended.id).state == "completed"
+        assert store.list_runs(ended.id)[0] == []
+        assert store.get(counted.id).state == "completed"
+        assert len(store.list_runs(counted.id)[0]) == 2
+        assert store.list_uninitialized_tasks() == []
     finally:
         await scheduler.stop()
